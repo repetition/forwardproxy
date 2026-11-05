@@ -119,6 +119,7 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision ensures that h is set up properly before use.
 func (h *Handler) Provision(ctx caddy.Context) error {
+	initTrafficServer()
 	h.logger = ctx.Logger(h)
 
 	if h.DialTimeout <= 0 {
@@ -252,8 +253,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	var authErr error
+	var authUser string
 	if h.AuthCredentials != nil {
 		authErr = h.checkCredentials(r)
+		if authErr == nil {
+			authUser = h.extractUsername(r)
+		}
 	}
 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
 		return serveHiddenPage(w, authErr)
@@ -340,6 +345,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			return caddyhttp.Error(http.StatusForbidden,
 				fmt.Errorf("hostname %s is not allowed", r.URL.Hostname()))
 		}
+		targetConn = wrapTargetConn(targetConn, authUser)
 		defer targetConn.Close()
 
 		switch r.ProtoMajor {

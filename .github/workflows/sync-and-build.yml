@@ -1,0 +1,105 @@
+name: Sync Upstream & Build Custom Caddy
+
+on:
+  schedule:
+    # Runs daily at 18:00 UTC (02:00 CST)
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build binary even if upstream has no new commits'
+        required: false
+        default: 'true'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Fork (naive branch)
+        uses: actions/checkout@v4
+        with:
+          ref: naive
+          fetch-depth: 0
+
+      - name: Sync & Rebase onto Upstream
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BEFORE_SHA=$(git rev-parse HEAD)
+          git remote add upstream https://github.com/klzgrad/forwardproxy.git || true
+          git fetch upstream naive
+
+          if git rebase upstream/naive; then
+            AFTER_SHA=$(git rev-parse HEAD)
+            if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
+              echo "Upstream updated! Pushing rebased branch..."
+              git push origin naive --force-with-lease
+              echo "updated=true" >> $GITHUB_OUTPUT
+            else
+              echo "Already up-to-date with upstream."
+              echo "updated=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "::error::Rebase conflict detected against upstream/naive. Aborting rebase."
+            git rebase --abort
+            exit 1
+          fi
+
+      - name: Read Caddy Version
+        if: steps.sync.outputs.updated == 'true' || github.event.inputs.force_build == 'true' || github.event_name == 'workflow_dispatch'
+        run: printf 'CADDY_VERSION=%s\n' "$(<CADDY_VERSION)" >> "$GITHUB_ENV"
+
+      - name: Checkout & Patch Caddy (BBRv1 + Read Idle Timeout)
+        if: steps.sync.outputs.updated == 'true' || github.event.inputs.force_build == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          repository: caddyserver/caddy
+          ref: ${{ env.CADDY_VERSION }}
+          path: .caddy-bbr
+
+      - name: Apply Caddy Patches
+        if: steps.sync.outputs.updated == 'true' || github.event.inputs.force_build == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          git -C .caddy-bbr apply "$GITHUB_WORKSPACE/caddy-sing-quic-bbrv1.patch" "$GITHUB_WORKSPACE/caddy-read-idle-timeout.patch"
+
+      - name: Set up Go
+        if: steps.sync.outputs.updated == 'true' || github.event.inputs.force_build == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '^1.26.x'
+
+      - name: Run Unit Tests
+        if: steps.sync.outputs.updated == 'true' || github.event.inputs.force_build == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          go work init . ./.caddy-bbr
+          go test -v -race -run "TestWrapTargetConn|TestHandleTrafficQueryAndReset|TestExtractUsername|TestTrackingReaderWriterAndResponseWriter" .
+          rm -f go.work go.work.sum
+
+      - name: Build Custom Caddy with xcaddy
+        if: steps.sync.outputs.updated == 'true' || github.event.inputs.force_build == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+          # Use local checkout replacement so xcaddy builds exact current commit with patched Caddy
+          xcaddy build "$CADDY_VERSION" \
+            --replace "github.com/caddyserver/caddy/v2=$GITHUB_WORKSPACE/.caddy-bbr" \
+            --with "github.com/caddyserver/forwardproxy=$GITHUB_WORKSPACE" \
+            --with github.com/caddy-dns/cloudflare \
+            --output ./caddy
+
+          chmod +x ./caddy
+          ./caddy list-modules | grep -E "forward_proxy|dns.providers.cloudflare"
+
+      - name: Upload Caddy Binary Artifact
+        if: steps.sync.outputs.updated == 'true' || github.event.inputs.force_build == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: caddy-naive-cloudflare-linux-amd64
+          path: ./caddy
+          retention-days: 14
