@@ -27,6 +27,26 @@ func resetTrafficStatsForTest() {
 	})
 }
 
+// AI-code-start lines:8
+func domainSnapshot(ut *UserTraffic, host string) DomainTrafficSnapshot {
+	val, ok := ut.Domains.Load(host)
+	if !ok {
+		return DomainTrafficSnapshot{}
+	}
+	dt := val.(*DomainTraffic)
+	return DomainTrafficSnapshot{Upload: dt.Upload.Load(), Download: dt.Download.Load()}
+}
+
+// AI-code-start lines:8
+func domainKeyCount(ut *UserTraffic) int {
+	n := 0
+	ut.Domains.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
 func TestWrapTargetConn(t *testing.T) {
 	resetTrafficStatsForTest()
 
@@ -34,7 +54,8 @@ func TestWrapTargetConn(t *testing.T) {
 	defer c2.Close()
 
 	mockConn := &mockCloseWriteConn{Conn: c1}
-	wrapped := wrapTargetConn(mockConn, "alice")
+	host := "example.com:443"
+	wrapped := wrapTargetConn(mockConn, "alice", host)
 
 	ut := getOrCreateUserTraffic("alice")
 	if got := ut.Connections.Load(); got != 1 {
@@ -54,6 +75,9 @@ func TestWrapTargetConn(t *testing.T) {
 	if got := ut.Upload.Load(); got != int64(len(uploadPayload)) {
 		t.Fatalf("expected Upload=%d, got %d", len(uploadPayload), got)
 	}
+	if ds := domainSnapshot(ut, host); ds.Upload != int64(len(uploadPayload)) {
+		t.Fatalf("expected domains[%s].up=%d, got %d", host, len(uploadPayload), ds.Upload)
+	}
 
 	// Test Read -> Download
 	downloadPayload := []byte("response from target server")
@@ -67,6 +91,9 @@ func TestWrapTargetConn(t *testing.T) {
 	}
 	if got := ut.Download.Load(); got != int64(len(downloadPayload)) {
 		t.Fatalf("expected Download=%d, got %d", len(downloadPayload), got)
+	}
+	if ds := domainSnapshot(ut, host); ds.Download != int64(len(downloadPayload)) {
+		t.Fatalf("expected domains[%s].down=%d, got %d", host, len(downloadPayload), ds.Download)
 	}
 	if got := ut.LastActive.Load(); got <= 0 {
 		t.Fatalf("expected LastActive > 0, got %d", got)
@@ -100,6 +127,9 @@ func TestHandleTrafficQueryAndReset(t *testing.T) {
 	ut.Download.Store(4096)
 	ut.Connections.Store(2)
 	ut.LastActive.Store(1700000000)
+	dt := getOrCreateDomainTraffic(ut, "example.com:443")
+	dt.Upload.Store(100)
+	dt.Download.Store(200)
 
 	// Query without reset
 	req1 := httptest.NewRequest(http.MethodGet, "/internal/naive/traffic?reset=false", nil)
@@ -120,6 +150,9 @@ func TestHandleTrafficQueryAndReset(t *testing.T) {
 	if bob1.Upload != 1024 || bob1.Download != 4096 || bob1.Connections != 2 || bob1.LastActive != 1700000000 {
 		t.Fatalf("unexpected snapshot before reset: %+v", bob1)
 	}
+	if d, ok := bob1.Domains["example.com:443"]; !ok || d.Upload != 100 || d.Download != 200 {
+		t.Fatalf("unexpected domain snapshot before reset: %+v", bob1.Domains)
+	}
 	// Values should remain unchanged after reset=false
 	if ut.Upload.Load() != 1024 || ut.Download.Load() != 4096 {
 		t.Fatalf("counters were unexpectedly modified on reset=false")
@@ -138,9 +171,94 @@ func TestHandleTrafficQueryAndReset(t *testing.T) {
 	if bob2.Upload != 1024 || bob2.Download != 4096 || bob2.Connections != 2 {
 		t.Fatalf("unexpected snapshot returned by reset=true: %+v", bob2)
 	}
+	if d, ok := bob2.Domains["example.com:443"]; !ok || d.Upload != 100 || d.Download != 200 {
+		t.Fatalf("unexpected domain snapshot returned by reset=true: %+v", bob2.Domains)
+	}
 	// Values should now be 0 in atomic counters
 	if ut.Upload.Load() != 0 || ut.Download.Load() != 0 {
 		t.Fatalf("expected Upload=0 and Download=0 after reset=true, got up=%d down=%d", ut.Upload.Load(), ut.Download.Load())
+	}
+	if ds := domainSnapshot(ut, "example.com:443"); ds.Upload != 0 || ds.Download != 0 {
+		t.Fatalf("expected domain counters zeroed after reset, got %+v", ds)
+	}
+
+	// Subsequent reset=true evicts idle domain keys
+	req3 := httptest.NewRequest(http.MethodGet, "/internal/naive/traffic?reset=true", nil)
+	rec3 := httptest.NewRecorder()
+	handleTrafficQuery(rec3, req3)
+	if domainKeyCount(ut) != 0 {
+		t.Fatalf("expected idle domains evicted after second reset, remaining=%d", domainKeyCount(ut))
+	}
+	var snap3 map[string]UserTrafficSnapshot
+	if err := json.Unmarshal(rec3.Body.Bytes(), &snap3); err != nil {
+		t.Fatalf("failed to unmarshal second reset response: %v", err)
+	}
+	if d, ok := snap3["bob"].Domains["example.com:443"]; ok {
+		t.Fatalf("expected evicted domain absent from snapshot, got %+v", d)
+	}
+}
+
+// AI-code-start lines:62
+func TestMultipleDomainsIndependent(t *testing.T) {
+	resetTrafficStatsForTest()
+
+	c1a, c2a := net.Pipe()
+	c1b, c2b := net.Pipe()
+	defer c2a.Close()
+	defer c2b.Close()
+
+	w1 := wrapTargetConn(c1a, "alice", "example.com:443")
+	w2 := wrapTargetConn(c1b, "alice", "github.com:443")
+	defer w1.Close()
+	defer w2.Close()
+
+	up1 := []byte("aaaa")
+	up2 := []byte("bbbbbb")
+	go func() {
+		buf := make([]byte, len(up1))
+		_, _ = c2a.Read(buf)
+	}()
+	if _, err := w1.Write(up1); err != nil {
+		t.Fatalf("write example.com: %v", err)
+	}
+	go func() {
+		buf := make([]byte, len(up2))
+		_, _ = c2b.Read(buf)
+	}()
+	if _, err := w2.Write(up2); err != nil {
+		t.Fatalf("write github.com: %v", err)
+	}
+
+	down1 := []byte("ccccc")
+	down2 := []byte("dd")
+	go func() {
+		_, _ = c2a.Write(down1)
+	}()
+	buf := make([]byte, 16)
+	if _, err := w1.Read(buf); err != nil {
+		t.Fatalf("read example.com: %v", err)
+	}
+	go func() {
+		_, _ = c2b.Write(down2)
+	}()
+	if _, err := w2.Read(buf); err != nil {
+		t.Fatalf("read github.com: %v", err)
+	}
+
+	ut := getOrCreateUserTraffic("alice")
+	ex := domainSnapshot(ut, "example.com:443")
+	gh := domainSnapshot(ut, "github.com:443")
+	if ex.Upload != int64(len(up1)) || ex.Download != int64(len(down1)) {
+		t.Fatalf("example.com counters mismatch: %+v", ex)
+	}
+	if gh.Upload != int64(len(up2)) || gh.Download != int64(len(down2)) {
+		t.Fatalf("github.com counters mismatch: %+v", gh)
+	}
+	if ut.Upload.Load() != int64(len(up1)+len(up2)) {
+		t.Fatalf("user upload should sum domains, got %d", ut.Upload.Load())
+	}
+	if ut.Download.Load() != int64(len(down1)+len(down2)) {
+		t.Fatalf("user download should sum domains, got %d", ut.Download.Load())
 	}
 }
 

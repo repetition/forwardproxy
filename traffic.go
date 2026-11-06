@@ -14,18 +14,31 @@ import (
 	"time"
 )
 
+// AI-code-start lines:25
+type DomainTraffic struct {
+	Upload   atomic.Int64 `json:"up"`
+	Download atomic.Int64 `json:"down"`
+}
+
+type DomainTrafficSnapshot struct {
+	Upload   int64 `json:"up"`
+	Download int64 `json:"down"`
+}
+
 type UserTraffic struct {
 	Upload      atomic.Int64
 	Download    atomic.Int64
 	Connections atomic.Int64
 	LastActive  atomic.Int64
+	Domains     sync.Map // key: domain (string), value: *DomainTraffic
 }
 
 type UserTrafficSnapshot struct {
-	Upload      int64 `json:"upload"`
-	Download    int64 `json:"download"`
-	Connections int64 `json:"connections"`
-	LastActive  int64 `json:"last_active"`
+	Upload      int64                            `json:"upload"`
+	Download    int64                            `json:"download"`
+	Connections int64                            `json:"connections"`
+	LastActive  int64                            `json:"last_active"`
+	Domains     map[string]DomainTrafficSnapshot `json:"domains,omitempty"`
 }
 
 var (
@@ -64,6 +77,19 @@ func getOrCreateUserTraffic(user string) *UserTraffic {
 	return actual.(*UserTraffic)
 }
 
+// AI-code-start lines:10
+func getOrCreateDomainTraffic(ut *UserTraffic, targetHost string) *DomainTraffic {
+	if targetHost == "" {
+		targetHost = "_unknown_"
+	}
+	if val, ok := ut.Domains.Load(targetHost); ok {
+		return val.(*DomainTraffic)
+	}
+	actual, _ := ut.Domains.LoadOrStore(targetHost, &DomainTraffic{})
+	return actual.(*DomainTraffic)
+}
+
+// AI-code-start lines:62
 func handleTrafficQuery(w http.ResponseWriter, r *http.Request) {
 	reset := r.URL.Query().Get("reset") == "true" || r.URL.Query().Get("reset") == "1"
 	result := make(map[string]UserTrafficSnapshot)
@@ -84,13 +110,40 @@ func handleTrafficQuery(w http.ResponseWriter, r *http.Request) {
 		conns := ut.Connections.Load()
 		lastActive := ut.LastActive.Load()
 
-		// Only return entries that have activity or active connections
-		if up > 0 || down > 0 || conns > 0 || !reset {
+		domainsSnap := make(map[string]DomainTrafficSnapshot)
+		ut.Domains.Range(func(dk, dv any) bool {
+			domain := dk.(string)
+			dt := dv.(*DomainTraffic)
+
+			var dUp, dDown int64
+			if reset {
+				dUp = dt.Upload.Swap(0)
+				dDown = dt.Download.Swap(0)
+				// Evict idle domain entries on reset to prevent memory growth
+				if dUp == 0 && dDown == 0 {
+					ut.Domains.Delete(dk)
+				}
+			} else {
+				dUp = dt.Upload.Load()
+				dDown = dt.Download.Load()
+			}
+
+			if dUp > 0 || dDown > 0 {
+				domainsSnap[domain] = DomainTrafficSnapshot{
+					Upload:   dUp,
+					Download: dDown,
+				}
+			}
+			return true
+		})
+
+		if up > 0 || down > 0 || conns > 0 || len(domainsSnap) > 0 || !reset {
 			result[user] = UserTrafficSnapshot{
 				Upload:      up,
 				Download:    down,
 				Connections: conns,
 				LastActive:  lastActive,
+				Domains:     domainsSnap,
 			}
 		}
 		return true
@@ -129,16 +182,20 @@ func (h Handler) extractUsername(r *http.Request) string {
 type trackedReadWriteCloser struct {
 	net.Conn
 	ut     *UserTraffic
+	dt     *DomainTraffic
 	closed atomic.Bool
 }
 
-func wrapTargetConn(conn net.Conn, username string) net.Conn {
+// AI-code-start lines:12
+func wrapTargetConn(conn net.Conn, username string, targetHost string) net.Conn {
 	ut := getOrCreateUserTraffic(username)
+	dt := getOrCreateDomainTraffic(ut, targetHost)
 	ut.Connections.Add(1)
 	ut.LastActive.Store(time.Now().Unix())
 	return &trackedReadWriteCloser{
 		Conn: conn,
 		ut:   ut,
+		dt:   dt,
 	}
 }
 
@@ -146,6 +203,7 @@ func (t *trackedReadWriteCloser) Read(p []byte) (int, error) {
 	n, err := t.Conn.Read(p)
 	if n > 0 {
 		t.ut.Download.Add(int64(n))
+		t.dt.Download.Add(int64(n))
 		t.ut.LastActive.Store(time.Now().Unix())
 	}
 	return n, err
@@ -155,6 +213,7 @@ func (t *trackedReadWriteCloser) Write(p []byte) (int, error) {
 	n, err := t.Conn.Write(p)
 	if n > 0 {
 		t.ut.Upload.Add(int64(n))
+		t.dt.Upload.Add(int64(n))
 		t.ut.LastActive.Store(time.Now().Unix())
 	}
 	return n, err

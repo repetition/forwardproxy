@@ -345,7 +345,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			return caddyhttp.Error(http.StatusForbidden,
 				fmt.Errorf("hostname %s is not allowed", r.URL.Hostname()))
 		}
-		targetConn = wrapTargetConn(targetConn, authUser)
+		targetConn = wrapTargetConn(targetConn, authUser, hostPort)
 		defer targetConn.Close()
 
 		switch r.ProtoMajor {

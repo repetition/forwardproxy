@@ -1,0 +1,29 @@
+{
+	order forward_proxy first
+	https_port 8443
+	http_port 8080
+	auto_https disable_redirects
+	admin off
+}
+
+# Local Naive / forward_proxy smoke test.
+# Start:
+#   .\caddy.exe run --config Caddyfile.test --adapter caddyfile
+# Traffic API (started with the plugin, localhost only):
+#   curl http://127.0.0.1:9199/internal/naive/traffic
+#   curl "http://127.0.0.1:9199/internal/naive/traffic?reset=true"
+:8443 {
+	bind 127.0.0.1
+	tls internal
+
+	forward_proxy {
+		basic_auth alice alice-test
+		basic_auth bob bob-test
+		ports 80 443
+		hide_ip
+		hide_via
+		dial_timeout 30s
+	}
+
+	respond "forwardproxy local test" 200
+}
