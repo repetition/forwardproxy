@@ -257,7 +257,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if h.AuthCredentials != nil {
 		authErr = h.checkCredentials(r)
 		if authErr == nil {
-			authUser = h.extractUsername(r)
+			authUser = usernameFromReplacer(r)
+			if authUser == "" {
+				authUser = h.extractUsername(r)
+			}
 		}
 	}
 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
@@ -457,6 +460,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	return forwardResponse(w, response)
+}
+
+// AI-code-start lines:11
+func usernameFromReplacer(r *http.Request) string {
+	repl, ok := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	if !ok || repl == nil {
+		return ""
+	}
+	user, ok := repl.GetString("http.auth.user.id")
+	if !ok {
+		return ""
+	}
+	return user
 }
 
 func (h Handler) checkCredentials(r *http.Request) error {
